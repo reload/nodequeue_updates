@@ -1,0 +1,5 @@
+name = Nodequeue Updates
+description = Display information regarding whén a nodequeue was updated and by who
+package = Nodequeue
+dependencies[] = nodequeue
+core = 6.x
