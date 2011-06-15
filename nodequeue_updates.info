@@ -1,4 +1,4 @@
-name = Nodequeue Updates
+name = Nodequeue updates
 description = Display information regarding whén a nodequeue was updated and by who
 package = Nodequeue
 dependencies[] = nodequeue

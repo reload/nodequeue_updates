@@ -1,0 +1,171 @@
+<?php
+
+/**
+ * Implementation of hook_form_ID_alter().
+ */
+function nodequeue_updates_form_nodequeue_arrange_subqueue_form_alter(&$form, &$form_state) {
+	// Add our submit handler for registering queue updates
+	$form['#submit'][] = 'nodequeue_update_submit';
+}
+
+function nodequeue_update_submit($form, &$form_state) {
+	global $user;
+
+	//Collect update info
+	$update = new stdClass();
+	$update->qid = $form['#queue']['qid']; //TODO: Consider subqueue support
+	$update->uid = $user->uid;
+	$update->timestamp = (isset($_SERVER['REQUEST_TIME'])) ? $_SERVER['REQUEST_TIME'] : time();
+	
+	$keys = (db_result(db_query('SELECT qid FROM {nodequeue_updates} WHERE qid = %d', $update->qid))) ? array('qid') : NULL;
+	drupal_write_record('nodequeue_updates', $update, $keys);
+}
+
+/**
+ * Implementation of hook_theme().
+ */
+function nodequeue_updates_theme() {
+	return array(
+		'nodequeue_updates_queue_table' => array(
+			'arguments' => array('header' => NULL, 'rows' => NULL, 'attributes' => NULL, 'caption' => NULL),
+		),
+	);
+}
+
+/**
+ * Theme the nodequeues table. Signature matches the theme_table it replaces.
+ */
+function theme_nodequeue_updates_queue_table($header, $rows, $attributes = array(), $caption = NULL) {
+	// We do some processing here as theme functions does not support preprocessing.
+	// Add the last update column	
+	array_splice($header, 1, 0, array(array('data' => t('Last update'), 'field' => 'update')));
+	
+	// Fetch and show when each queue was last updated - if data is available
+	foreach($rows as &$row) {
+		$last_update = '-';
+		// HACK: We do not have information regarding which queue is represented by each
+		// row available here, but we can extract it from the links...
+		// TODO: Consider subqueue support
+		if (preg_match('/nodequeue\/(\d+)\//', $row[3]['data'], $matches)) {
+			// Get latest update information
+			if ($update = db_fetch_array(db_query_range('SELECT uid, timestamp FROM {nodequeue_updates} WHERE qid = %d', $matches[1], 0, 1))) {
+				$last_update = t('%date by !user', array('%date' => format_date($update['timestamp'], 'small'), '!user' => theme('username', user_load($update['uid']))));
+			}
+		}
+		array_splice($row, 1, 0, array(array('class' => 'nodequeue-last-update', 'data' => $last_update)));
+	}
+	
+	return theme('table', $header, $rows, $attributes, $caption);
+}
+
+// Code below is a hack required as we need to make changes to the nodequeue
+// table. The default implementation does not offer any hooks or separate theming
+// layer which supports this. 
+
+/**
+ * Implementation of hook_menu_alter().
+ */
+function nodequeue_updates_menu_alter(&$menu) {
+	//Replace the exisitng page callback with our own
+	$menu['admin/content/nodequeue']['page callback'] = 'nodequeue_updates_view_queues';
+}
+
+/**
+ * An exact copy of nodequeue_view_queues() with support for theming
+ * the nodequeue table.
+ */
+function nodequeue_updates_view_queues() {
+  $output = theme('advanced_help_topic', 'nodequeue', 'about', 'icon') . '&nbsp;' . theme('advanced_help_topic', 'nodequeue', 'about', t('Click here for information about this module'));
+  // Fetch all of the queues.
+  $queues = nodequeue_load_queues(nodequeue_get_all_qids(25));
+  foreach ($queues as $queue) {
+    if (!nodequeue_queue_access($queue)) {
+      unset($queues[$queue->qid]);
+    }
+  }
+
+  if (empty($queues)) {
+    return $output . t('No nodequeues exist.');
+  }
+
+  $header = array(
+    array('data' => t('Title'), 'field' => 'title', 'sort' => 'asc'),
+    array('data' => t('Max nodes'), 'field' => 'size'),
+    array('data' => t('Subqueues'), 'field' => 'subqueues'),
+    array('data' => t('Operation')),
+  );
+  $table_sort = tablesort_init($header);
+
+  $qids = array();
+  $sort_primary = array();
+  $sort_secondary = array();
+  $sort_direction_regular = array('asc' => SORT_ASC, 'desc' => SORT_DESC);
+  $sort_direction_reverse = array('asc' => SORT_DESC, 'desc' => SORT_ASC);
+  foreach ($queues as $queue) {
+    // If a queue has only one subqueue, store the qid so we can display
+    // the number of nodes in the subqueue.
+    if ($queue->subqueues == 1) {
+      $qids[] = $queue->qid;
+    }
+    $sort_secondary[] = $queue->title;
+    switch ($table_sort['sql']) {
+      case 'title':
+      default:
+        $sort_primary[] = $queue->title;
+        $sort_direction = $sort_direction_regular;
+        break;
+      case 'size':
+        $sort_primary[] = $queue->size;
+        $sort_direction = $sort_direction_reverse;
+        break;
+      case 'subqueues':
+        $sort_primary[] = $queue->subqueues;
+        $sort_direction = $sort_direction_regular;
+        break;
+    }
+  }
+
+  $subqueues = nodequeue_load_subqueues_by_queue($qids);
+  // Relate all the subqueues we loaded back to our queues.
+  foreach ($subqueues as $subqueue) {
+     if (nodequeue_api_subqueue_access($subqueue, NULL, $queues[$subqueue->qid])) {
+       $queues[$subqueue->qid]->subqueue = $subqueue;
+     }
+  }
+
+  if (!empty($table_sort)) {
+    if (strtolower($table_sort['sort']) == 'desc') {
+      array_multisort($sort_primary, $sort_direction['desc'], $sort_secondary, $queues); // Re-indexes array keys; key no longer equals qid.
+    }
+    else {
+      array_multisort($sort_primary, $sort_direction['asc'], $sort_secondary, $queues); // Re-indexes array keys; key no longer equals qid.
+    }
+  }
+
+  $rows = array();
+  foreach ($queues as $queue) {
+    $sub_text = $queue->subqueues;
+    if ($sub_text == 1) {
+      $sub_text .= " (". nodequeue_subqueue_size_text($queue->size, $queue->subqueue->count) .")";
+    }
+
+    $operations = array(l(t('View'), "admin/content/nodequeue/$queue->qid/view"));
+    if (user_access('administer nodequeue')) {
+      $operations[] = l(t('Edit'), "admin/content/nodequeue/$queue->qid/edit");
+      $operations[] = l(t('Delete'), "admin/content/nodequeue/$queue->qid/delete");
+    }
+
+    $rows[] = array(
+      array('class' => 'nodequeue-title', 'data' => check_plain($queue->title)),
+      array('class' => 'nodequeue-max-nodes', 'data' => $queue->size == 0 ? t('Infinite') : $queue->size),
+      array('class' => 'nodequeue-subqueues', 'data' => $sub_text),
+      array('class' => 'nodequeue-operation', 'data' => implode(' | ', $operations)),
+    );
+  }
+
+  // Was: $output .= theme('table', $header, $rows);
+  $output .= theme('nodequeue_updates_queue_table', $header, $rows);
+  $output .= theme('pager', NULL, 25);
+
+  return  $output;	
+}
